@@ -61,12 +61,14 @@ __global__ void sgemm_V1(
     
     // 当前thread负责把A中的相关数据从global memory加载到SMEM，
     // 这里在计算该thread负责加载的第一个数在s_a中的row
+    //Bk等于4,搬运sub_A中的一行需要2个thread
     int load_a_smem_m = tid >> 1;  // tid/2, row of s_a
     // 当前thread负责加载的第一个数在s_a中的col
     int load_a_smem_k = (tid & 1) << 2;  // (tid % 2 == 0) ? 0 : 4, col of s_a
     
     // 当前thread负责把B中的相关数据从global memory加载到SMEM，
     // 这里在计算该thread负责加载的第一个数在s_b中的row
+    //sub_B中，Bn=128,单个tread一次搬4个数据，32个thread搬完完整的一行
     int load_b_smem_k = tid >> 5;   // tid/32, row of s_b
     // 当前thread负责加载的第一个数在s_b中的col
     int load_b_smem_n = (tid & 31) << 2;  // (tid % 32) * 4, col of s_b
@@ -126,7 +128,7 @@ __global__ void sgemm_V1(
                 }
             }
         }
-        // 做一次同步，保证所有的thread都计算完当前所维护的（TM, TN）块
+        // 做一次同步，保证所有的thread都计算完当前所维护的（TM, TNß）块
         __syncthreads();
     }
 
