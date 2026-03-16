@@ -169,7 +169,7 @@ int main(int argc, char **argv) {
     // 大矩阵时 CPU 参考实现会很慢，所以这里设置了一个简单阈值，太大就跳过。
     if (opt.common.check) {
         const long long ops = 1LL * opt.common.m * opt.common.n * opt.common.k;
-        if (ops > 200000000LL) {
+        if (ops > 200000000000LL) {
             std::printf("CHECK kernel=%s skipped=1 reason=matrix_too_large_for_cpu_reference\n", kernel->name);
         } else {
             std::vector<float> h_ref(size_c, 0.0f);

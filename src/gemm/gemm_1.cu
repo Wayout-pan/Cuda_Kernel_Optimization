@@ -62,11 +62,11 @@ __global__ void sgemm_V1(const float *__restrict__ a,
     // A 子块大小是 128 x 8 = 1024 个 float。
     // 一个 block 有 (128/8) x (128/8) = 16 x 16 = 256 个线程。
     // 因此平均每个线程需要搬 1024 / 256 = 4 个 float。
-    const int load_a_smem_m = tid >> 1;
-    const int load_a_smem_k = (tid & 1) << 2;
-    const int load_b_smem_k = tid >> 5;
-    const int load_b_smem_n = (tid & 31) << 2;
-
+    // 
+    const int load_a_smem_m = tid >> 1; //等价于 tid / 2：2个线程搬1行数据(8个)，/2就可以得到当前线程搬第几行
+    const int load_a_smem_k = (tid & 1) << 2; // 等价于tid % 2 == 1 ? 4 : 0 四个四个搬，因此k的起始要么是0要么是4，第零个线程从k=0开始搬运，第二个从k=4开始，第三个又从0开始
+    const int load_b_smem_k = tid >> 5; // 等价于 tid / 32 因为一行有128个，32*4=128,因此/32得到该tid搬运第几行的
+    const int load_b_smem_n = (tid & 31) << 2; // 等价于(tid % 32) * 4, tid%32表示按照4个数据为一个单位，该搬第几个单位，*4就是恢复到了原本的列(n)索引
     // 计算这批数据在 global memory 中的起始位置。
     const int load_a_gmem_m = by * kBm + load_a_smem_m;
     const int load_b_gmem_n = bx * kBn + load_b_smem_n;
@@ -76,7 +76,7 @@ __global__ void sgemm_V1(const float *__restrict__ a,
     for (int bk = 0; bk < (k + kBk - 1) / kBk; ++bk) {
         const int load_a_gmem_k = bk * kBk + load_a_smem_k;
         const int load_a_gmem_addr = OFFSET(load_a_gmem_m, load_a_gmem_k, k);
-        FLOAT4(s_a[load_a_smem_m][load_a_smem_k]) = FLOAT4_CONST(a[load_a_gmem_addr]);
+        FLOAT4(s_a[load_a_smem_m][load_a_smem_k]) = FLOAT4_CONST(a[load_a_gmem_addr]); //将a中load_a_gmem_addr地址的连续四个数据搬到对应s_a对应的位置
 
         const int load_b_gmem_k = bk * kBk + load_b_smem_k;
         const int load_b_gmem_addr = OFFSET(load_b_gmem_k, load_b_gmem_n, n);

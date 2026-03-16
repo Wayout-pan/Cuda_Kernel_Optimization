@@ -6,6 +6,17 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 
+from visualize_common import (
+    accumulate_outer_product,
+    box,
+    draw_accum,
+    draw_reg_block,
+    make_value_a,
+    make_value_b,
+    resolve_trace_scope,
+    zero_accum,
+)
+
 BLOCK_SIZE = 16
 BLOCK_M = 128
 BLOCK_N = 128
@@ -27,24 +38,6 @@ class ThreadMapping:
     col_b: int
     row_c: int
     col_c: int
-
-
-def box(title: str, lines: list[str]) -> None:
-    width = max(len(title), *(len(line) for line in lines)) if lines else len(title)
-    print("+" + "-" * (width + 2) + "+")
-    print(f"| {title.ljust(width)} |")
-    print("+" + "-" * (width + 2) + "+")
-    for line in lines:
-        print(f"| {line.ljust(width)} |")
-    print("+" + "-" * (width + 2) + "+")
-
-
-def make_value_a(row: int, col: int) -> float:
-    return row * 100.0 + col
-
-
-def make_value_b(row: int, col: int) -> float:
-    return row * 1000.0 + col
 
 
 def mapping(thread_x: int, thread_y: int) -> ThreadMapping:
@@ -70,10 +63,10 @@ def pick_thread_from_warp(warp_id: int, lane: int) -> tuple[int, int]:
 
 
 def header(args: argparse.Namespace, info: ThreadMapping) -> None:
-    base_x = args.block_x * BLOCK_SIZE * TM
-    base_y = args.block_y * BLOCK_SIZE * TN
+    base_x = args.block_x * BLOCK_N
+    base_y = args.block_y * BLOCK_M
     box(
-        "GEMM_2 ASCII Visualization",
+        "GEMM_2 ASCII 教学可视化",
         [
             f"shape      : M={args.m} N={args.n} K={args.k}",
             f"blockIdx    : ({args.block_x}, {args.block_y})",
@@ -88,8 +81,94 @@ def header(args: argparse.Namespace, info: ThreadMapping) -> None:
     print()
 
 
+def launch_overview(args: argparse.Namespace) -> None:
+    grid_x = (args.n + BLOCK_N - 1) // BLOCK_N
+    grid_y = (args.m + BLOCK_M - 1) // BLOCK_M
+    block_row0 = args.block_y * BLOCK_M
+    block_col0 = args.block_x * BLOCK_N
+    box(
+        "1. Grid / Block 是怎么分的",
+        [
+            f"gridDim  = ({grid_x}, {grid_y})，每个 block 固定负责 C 的一个 {BLOCK_M}x{BLOCK_N} tile",
+            f"blockDim = ({BLOCK_SIZE}, {BLOCK_SIZE})，共 {BLOCK_SIZE * BLOCK_SIZE} 个线程",
+            f"blockIdx.x 沿 N 方向切块，blockIdx.y 沿 M 方向切块",
+            f"当前 block ({args.block_x}, {args.block_y}) 覆盖 C[{block_row0}:{block_row0 + BLOCK_M}, {block_col0}:{block_col0 + BLOCK_N}]",
+            f"K 维按 {BLOCK_K} 一组推进，因此这次一共要做 {args.k // BLOCK_K} 轮 K tile",
+        ],
+    )
+    print()
+
+
+def thread_overview(args: argparse.Namespace, info: ThreadMapping) -> None:
+    base_x = args.block_x * BLOCK_N
+    base_y = args.block_y * BLOCK_M
+    warp_tid0 = info.warp_id * WARP_SIZE
+    warp_members = [mapping_from_tid(warp_tid0 + lane) for lane in range(WARP_SIZE)]
+    warp_row0 = min(member.row_c for member in warp_members)
+    warp_row1 = max(member.row_c for member in warp_members) + TM
+    warp_col0 = min(member.col_c for member in warp_members)
+    warp_col1 = max(member.col_c for member in warp_members) + TN
+    box(
+        "2. 当前线程 / warp 负责什么",
+        [
+            f"tid 公式: tid = ty * {BLOCK_SIZE} + tx = {args.thread_y} * {BLOCK_SIZE} + {args.thread_x} = {info.tid}",
+            f"warp 划分: warp_id = tid >> 5 = {info.warp_id}，warp_lane = tid & 31 = {info.warp_lane}",
+            f"rowC = ((warp_id >> 1 << 2) + (lane & 3)) << 3 = {info.row_c}",
+            f"colC = (((warp_id & 1) << 3) + (lane >> 2)) << 3 = {info.col_c}",
+            f"当前线程最终负责 C[{base_y + info.row_c}:{base_y + info.row_c + TM}, {base_x + info.col_c}:{base_x + info.col_c + TN}]",
+            f"同一个 warp 的 32 个线程会被重排后覆盖 block 内的 C[{base_y + warp_row0}:{base_y + warp_row1}, {base_x + warp_col0}:{base_x + warp_col1}]",
+        ],
+    )
+    print()
+
+
+def shared_memory_overview(info: ThreadMapping) -> None:
+    box(
+        "3. shared memory 是怎么装数据的",
+        [
+            f"subA 逻辑上是 {BLOCK_M}x{BLOCK_K}，subB 逻辑上是 {BLOCK_K}x{BLOCK_N}",
+            f"A 装载索引: rowA = tid >> 1 = {info.row_a}，colA = (tid & 1) << 2 = {info.col_a}",
+            f"B 装载索引: rowB = tid >> 5 = {info.row_b}，colB = (tid << 2) & 127 = {info.col_b}",
+            "B 的写法比较直接：subB[tid*4 : tid*4+4] = float4(B[...])，等价于把一个 8x128 tile 线性铺平后顺序写入",
+            f"A 的写法更特别：subA[rowA + colA*{BLOCK_M}] 这种“按列存”的方式，相当于把 A tile 转成更利于后续读取的布局",
+            "这样做的目的，是让后面的 regA / regB 可以按 float4 连续读出来，减少地址计算并改善访问模式",
+        ],
+    )
+    print()
+
+
+def compute_overview(args: argparse.Namespace, info: ThreadMapping) -> None:
+    base_x = args.block_x * BLOCK_N
+    base_y = args.block_y * BLOCK_M
+    box(
+        "4. 线程在 block 内是怎么计算的",
+        [
+            f"每个 kk 都会从 shared memory 取出 8 个 A 值和 8 个 B 值，对应 patch 左上角 ({base_y + info.row_c}, {base_x + info.col_c})",
+            f"regA[0]/regA[1] 组成 A[{base_y + info.row_c}:{base_y + info.row_c + TM}, k]，regB[0]/regB[1] 组成 B[k, {base_x + info.col_c}:{base_x + info.col_c + TN}]",
+            f"随后在线程私有寄存器里做一个 {TM}x{TN} 的 outer product，累加到 c[64]",
+            "这就是 gemm_2 比 gemm_1 更激进的地方：输出 patch 的线程归属被 warp 级重排，计算也被手工展开到了寄存器级别",
+        ],
+    )
+    print()
+
+
+def trace_scope(tile_starts: list[int], kk_values: list[int], summary_only: bool) -> None:
+    tile_desc = ", ".join(f"[{start}:{start + BLOCK_K})" for start in tile_starts)
+    kk_desc = ", ".join(str(kk) for kk in kk_values)
+    box(
+        "5. 这次脚本会展示哪些步骤",
+        [
+            f"会展开的 K tile: {tile_desc}",
+            f"会展开的 kk    : {kk_desc}",
+            f"详细程度       : {'只看总览、warp 归属和最终寄存器结果' if summary_only else '把每个选中的 tile / kk 都展开'}",
+            "无论是否裁剪显示，最后都会给出跨完整 K 维度的最终寄存器累加结果",
+        ],
+    )
+    print()
+
+
 def tile_partition(info: ThreadMapping) -> None:
-    print("ASCII map: each cell is one 8x8 patch of C, labeled by owner tid")
+    print("ASCII 图：每个格子都是一个 8x8 输出 patch，格子里的数字是负责它的 tid")
     header_cols = "     " + " ".join(f"c{c:02d}" for c in range(BLOCK_N // TN))
     print(header_cols)
     print("     " + "-----" * (BLOCK_N // TN))
@@ -111,10 +190,10 @@ def tile_partition(info: ThreadMapping) -> None:
 
 
 def warp_overview(args: argparse.Namespace, info: ThreadMapping) -> None:
-    base_x = args.block_x * BLOCK_SIZE * TM
-    base_y = args.block_y * BLOCK_SIZE * TN
-    print(f"ASCII map: warp {info.warp_id} ownership inside the 128x128 block tile")
-    print("Each cell shows laneXX. Dots mean this 8x8 patch belongs to another warp.")
+    base_x = args.block_x * BLOCK_N
+    base_y = args.block_y * BLOCK_M
+    print(f"ASCII 图：warp {info.warp_id} 在当前 128x128 block tile 里的 patch 归属")
+    print("每个格子显示的是 laneXX；出现 .. 说明这个 8x8 patch 属于别的 warp。")
     print("     " + " ".join(f"c{c:02d}" for c in range(BLOCK_N // TN)))
     print("     " + "-------" * (BLOCK_N // TN))
     for patch_row in range(BLOCK_M // TM):
@@ -134,7 +213,7 @@ def warp_overview(args: argparse.Namespace, info: ThreadMapping) -> None:
             cells.append(label)
         print(f"r{patch_row:02d} |" + "|".join(cells) + "|")
     print()
-    print("Warp member list")
+    print("当前 warp 的成员分工表")
     print("+------+-----------+-------------+-------------+----------------+")
     print("| lane | threadIdx  | A load      | B load      | C patch start  |")
     print("+------+-----------+-------------+-------------+----------------+")
@@ -149,7 +228,7 @@ def warp_overview(args: argparse.Namespace, info: ThreadMapping) -> None:
             f" B[{t.row_b:1d},{base_x + t.col_b:3d}:{base_x + t.col_b + 4:3d}] | ({base_y + t.row_c:3d},{base_x + t.col_c:3d})         |"
         )
     print("+------+-----------+-------------+-------------+----------------+")
-    print("* marks the selected thread/lane")
+    print("* 这一行表示当前选中的线程 / lane")
     print()
 
 
@@ -158,7 +237,7 @@ def draw_suba(info: ThreadMapping, base_y: int, tile_start_k: int) -> None:
     row_end = min(BLOCK_M, info.row_a + 3)
     col_begin = max(0, info.col_a)
     col_end = min(BLOCK_K, info.col_a + 4)
-    print("subA local ASCII window")
+    print("subA 局部窗口")
     print("      " + " ".join(f"k{c:02d}" for c in range(col_begin, col_end)))
     print("      " + "------" * (col_end - col_begin))
     for r in range(row_begin, row_end):
@@ -172,18 +251,16 @@ def draw_suba(info: ThreadMapping, base_y: int, tile_start_k: int) -> None:
                 cell = f" {value:4d} "
             cells.append(cell)
         print(f"r{r:03d} |" + "|".join(cells) + "|")
-    print("selected thread writes the bracketed cells")
+    print("带 [] 的格子就是当前线程写入 shared memory 的位置")
     print()
 
 
 def draw_subb(info: ThreadMapping, base_x: int, tile_start_k: int) -> None:
-    print("subB local ASCII window")
-    kk_center = info.tid * 4 // BLOCK_N
-    n_center = info.tid * 4 % BLOCK_N
-    kk_begin = max(0, kk_center)
-    kk_end = min(BLOCK_K, kk_center + 1)
-    n_begin = max(0, n_center - 8)
-    n_end = min(BLOCK_N, n_center + 12)
+    print("subB 局部窗口")
+    kk_begin = max(0, info.row_b)
+    kk_end = min(BLOCK_K, info.row_b + 1)
+    n_begin = max(0, info.col_b - 8)
+    n_end = min(BLOCK_N, info.col_b + 12)
     print("      " + " ".join(f"n{n:03d}" for n in range(n_begin, n_end)))
     print("      " + "-------" * (n_end - n_begin))
     for kk in range(kk_begin, kk_end):
@@ -191,44 +268,42 @@ def draw_subb(info: ThreadMapping, base_x: int, tile_start_k: int) -> None:
         for nn in range(n_begin, n_end):
             value = int(make_value_b(tile_start_k + kk, base_x + nn))
             cell = f"{value:5d}"
-            if info.tid * 4 <= kk * BLOCK_N + nn < info.tid * 4 + 4:
+            if kk == info.row_b and info.col_b <= nn < info.col_b + 4:
                 cell = f"[{value:5d}]"
             else:
                 cell = f" {value:5d} "
             cells.append(cell)
         print(f"k{kk:02d} |" + "|".join(cells) + "|")
-    print("selected thread writes the bracketed cells")
+    print("带 [] 的格子就是当前线程写入 shared memory 的位置")
     print()
 
 
 def k_tile_load_view(args: argparse.Namespace, info: ThreadMapping, tile_start_k: int) -> None:
-    base_x = args.block_x * BLOCK_SIZE * TM
-    base_y = args.block_y * BLOCK_SIZE * TN
+    base_x = args.block_x * BLOCK_N
+    base_y = args.block_y * BLOCK_M
     a_cols = [tile_start_k + info.col_a + t for t in range(4)]
     b_cols = [base_x + info.col_b + t for t in range(4)]
+    a_offset = (base_y + info.row_a) * args.k + a_cols[0]
+    b_offset = (tile_start_k + info.row_b) * args.n + b_cols[0]
     box(
-        f"K tile starting at k={tile_start_k}",
+        f"当前 K tile：k=[{tile_start_k}:{tile_start_k + BLOCK_K})",
         [
-            f"A load : row {base_y + info.row_a}, cols {a_cols}",
-            f"B load : row {tile_start_k + info.row_b}, cols {b_cols}",
+            f"A 装载: A[{base_y + info.row_a}, {a_cols[0]}:{a_cols[-1] + 1}]，起始偏移 = {a_offset}",
+            f"B 装载: B[{tile_start_k + info.row_b}, {b_cols[0]}:{b_cols[-1] + 1}]，起始偏移 = {b_offset}",
             f"subA   : rowslot {info.row_a}, colslots {list(range(info.col_a, info.col_a + 4))}",
-            f"subB   : linear slots {list(range(info.tid * 4, info.tid * 4 + 4))}",
+            (
+                f"subB   : rowslot {info.row_b}, colslots {list(range(info.col_b, info.col_b + 4))}，"
+                f"线性槽位 {list(range(info.tid * 4, info.tid * 4 + 4))}"
+            ),
         ],
     )
     draw_suba(info, base_y, tile_start_k)
     draw_subb(info, base_x, tile_start_k)
 
 
-def draw_reg_block(name: str, values: list[float]) -> None:
-    print(f"{name}")
-    print("+--------+--------+--------+--------+")
-    print("| " + " | ".join(f"{int(v):6d}" for v in values) + " |")
-    print("+--------+--------+--------+--------+")
-
-
 def kk_step(args: argparse.Namespace, info: ThreadMapping, tile_start_k: int, kk: int, accum: list[list[float]]) -> None:
-    base_x = args.block_x * BLOCK_SIZE * TM
-    base_y = args.block_y * BLOCK_SIZE * TN
+    base_x = args.block_x * BLOCK_N
+    base_y = args.block_y * BLOCK_M
     actual_k = tile_start_k + kk
     reg_a0 = [make_value_a(base_y + info.row_c + d, actual_k) for d in range(4)]
     reg_a1 = [make_value_a(base_y + info.row_c + 4 + d, actual_k) for d in range(4)]
@@ -236,15 +311,14 @@ def kk_step(args: argparse.Namespace, info: ThreadMapping, tile_start_k: int, kk
     reg_b1 = [make_value_b(actual_k, base_x + info.col_c + 4 + d) for d in range(4)]
     all_a = reg_a0 + reg_a1
     all_b = reg_b0 + reg_b1
-    for r in range(TM):
-        for c in range(TN):
-            accum[r][c] += all_a[r] * all_b[c]
+    accumulate_outer_product(accum, all_a, all_b)
     box(
         f"kk={kk}  actual_k={actual_k}",
         [
-            f"selected output patch top-left = ({base_y + info.row_c}, {base_x + info.col_c})",
-            f"example: c[0,0] += {int(all_a[0])} * {int(all_b[0])} -> {int(accum[0][0])}",
-            f"example: c[7,7] += {int(all_a[7])} * {int(all_b[7])} -> {int(accum[7][7])}",
+            f"当前输出 patch 左上角 = ({base_y + info.row_c}, {base_x + info.col_c})",
+            f"本轮实际使用的 K 下标 = tile_start_k + kk = {tile_start_k} + {kk} = {actual_k}",
+            f"示例 1: c[0,0] += {int(all_a[0])} * {int(all_b[0])} -> {int(accum[0][0])}",
+            f"示例 2: c[7,7] += {int(all_a[7])} * {int(all_b[7])} -> {int(accum[7][7])}",
         ],
     )
     draw_reg_block("regA[0]", reg_a0)
@@ -254,21 +328,22 @@ def kk_step(args: argparse.Namespace, info: ThreadMapping, tile_start_k: int, kk
     print()
 
 
-def draw_accum(accum: list[list[float]]) -> None:
-    print("8x8 register accumulator tile")
-    print("      " + " ".join(f"c{c}" for c in range(TN)))
-    print("      " + "------------" * TN)
-    for r in range(TM):
-        cells = [f"{int(accum[r][c]):10d}" for c in range(TN)]
-        print(f"r{r} |" + "|".join(cells) + "|")
-    print()
+def build_full_accum(args: argparse.Namespace, info: ThreadMapping) -> list[list[float]]:
+    base_x = args.block_x * BLOCK_N
+    base_y = args.block_y * BLOCK_M
+    accum = zero_accum(TM, TN)
+    for actual_k in range(args.k):
+        all_a = [make_value_a(base_y + info.row_c + d, actual_k) for d in range(TM)]
+        all_b = [make_value_b(actual_k, base_x + info.col_c + d) for d in range(TN)]
+        accumulate_outer_product(accum, all_a, all_b)
+    return accum
 
 
 def store_view(args: argparse.Namespace, info: ThreadMapping) -> None:
-    base_x = args.block_x * BLOCK_SIZE * TM
-    base_y = args.block_y * BLOCK_SIZE * TN
-    print("Final global store ASCII map for selected thread")
-    print("      left float4                right float4")
+    base_x = args.block_x * BLOCK_N
+    base_y = args.block_y * BLOCK_M
+    print("最终写回 global memory 的位置")
+    print("      左侧 float4                右侧 float4")
     print("+----+------------------------+------------------------+")
     for i in range(TM):
         row = base_y + info.row_c + i
@@ -290,6 +365,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--thread-y", type=int, default=0)
     parser.add_argument("--warp-id", type=int, help="Select a warp directly; thread will default to lane 0 unless --lane is given")
     parser.add_argument("--lane", type=int, default=0, help="Lane within the selected warp when --warp-id is used")
+    parser.add_argument("--tile-k", type=int, help="Only render the K tile starting at this global k offset")
+    parser.add_argument("--kk", type=int, help="Only render this kk inside each shown K tile")
+    parser.add_argument("--summary-only", action="store_true", help="Skip per-step tile details and only print mapping plus final accumulation")
     return parser.parse_args()
 
 
@@ -309,15 +387,27 @@ def main() -> None:
         raise SystemExit("thread-x and thread-y must be in [0, 15].")
 
     info = mapping(args.thread_x, args.thread_y)
+    tile_starts, kk_values = resolve_trace_scope(args.k, BLOCK_K, args.tile_k, args.kk)
+    full_accum = build_full_accum(args, info)
+
     header(args, info)
+    launch_overview(args)
+    thread_overview(args, info)
+    shared_memory_overview(info)
+    compute_overview(args, info)
+    trace_scope(tile_starts, kk_values, args.summary_only)
     tile_partition(info)
     warp_overview(args, info)
-    for tile_start_k in range(0, args.k, BLOCK_K):
-        k_tile_load_view(args, info, tile_start_k)
-        accum = [[0.0 for _ in range(TN)] for _ in range(TM)]
-        for kk in range(BLOCK_K):
-            kk_step(args, info, tile_start_k, kk, accum)
-        draw_accum(accum)
+
+    if not args.summary_only:
+        for tile_start_k in tile_starts:
+            k_tile_load_view(args, info, tile_start_k)
+            visible_accum = zero_accum(TM, TN)
+            for kk in kk_values:
+                kk_step(args, info, tile_start_k, kk, visible_accum)
+            draw_accum(visible_accum, f"当前可见步骤累计出的寄存器块（只统计 K tile [{tile_start_k}:{tile_start_k + BLOCK_K}) 里选中的 kk）")
+
+    draw_accum(full_accum, "跨完整 K 维度后的最终寄存器累加结果")
     store_view(args, info)
 
 
