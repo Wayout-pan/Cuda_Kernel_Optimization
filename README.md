@@ -2,10 +2,12 @@
 
 这个仓库用于做 CUDA 算子优化实验与教学分析。
 
-当前已经实现的是两个模块：
+当前已经实现的是四个模块：
 
 - 单精度 GEMM (`C = A x B`)
 - 一维 sum reduction
+- 矩阵 transpose (`B = A^T`)
+- scaled dot-product attention (`softmax(QK^T / sqrt(d))V`)
 
 后续会逐步扩展到更多算子，例如卷积、归约族算子、归一化、注意力相关 kernel 等。仓库的设计目标不再是“只优化 GEMM”，而是沉淀一套可复用的：
 
@@ -16,8 +18,8 @@
 
 ## 当前状态
 
-- 已落地模块：`gemm`、`reduction`
-- 已提供能力：kernel 实现、统一 runner、批量 benchmark、ASCII 教学可视化
+- 已落地模块：`gemm`、`reduction`、`transpose`、`attention`
+- 已提供能力：kernel 实现、统一 runner、批量 benchmark、性能图表、ASCII 教学可视化
 - 当前默认构建目标会编译所有已落地模块，后续新增算子时会按同样的模块化方式接入
 
 ## 仓库结构
@@ -26,8 +28,15 @@
 - `include/gemm/`: 当前 GEMM 模块的公共头文件
 - `src/reduction/`: 当前 reduction 模块的源码目录，包含 kernel、runner 和注册表
 - `include/reduction/`: 当前 reduction 模块的公共头文件
+- `src/transpose/`: 当前 transpose 模块的源码目录，包含 kernel、runner 和注册表
+- `include/transpose/`: 当前 transpose 模块的公共头文件
+- `src/attention/`: 当前 attention 模块的源码目录，包含 kernel、runner 和注册表
+- `include/attention/`: 当前 attention 模块的公共头文件
 - `scripts/bench_gemm.sh`: GEMM 的批量 benchmark 脚本
 - `scripts/bench_reduction.sh`: reduction 的批量 benchmark 脚本
+- `scripts/bench_transpose.sh`: transpose 的批量 benchmark 脚本
+- `scripts/bench_attention.sh`: attention 的批量 benchmark 脚本
+- `scripts/plot_benchmarks.py`: 从 benchmark CSV 生成图表
 - `scripts/visualize_gemm1.py`: `gemm_1` 的 ASCII 教学可视化脚本
 - `scripts/visualize_gemm2.py`: `gemm_2` 的 ASCII 教学可视化脚本
 - `scripts/compare_gemm1_gemm2_ascii.py`: `gemm_1` / `gemm_2` 的并排对比脚本
@@ -78,6 +87,18 @@ make gemm
 make reduction
 ```
 
+如果只编译 transpose：
+
+```bash
+make transpose
+```
+
+如果只编译 attention：
+
+```bash
+make attention
+```
+
 查看当前所有模块里可用的 kernel：
 
 ```bash
@@ -94,6 +115,18 @@ make list-gemm
 
 ```bash
 make list-reduction
+```
+
+只看当前 transpose 模块里可用的 kernel：
+
+```bash
+make list-transpose
+```
+
+只看当前 attention 模块里可用的 kernel：
+
+```bash
+make list-attention
 ```
 
 单独运行某个 GEMM kernel：
@@ -118,6 +151,24 @@ make bench-gemm
 
 ```bash
 make bench-reduction
+```
+
+只 benchmark transpose：
+
+```bash
+make bench-transpose
+```
+
+只 benchmark attention：
+
+```bash
+make bench-attention
+```
+
+根据最新 benchmark CSV 生成性能图表：
+
+```bash
+make plot
 ```
 
 自定义 GEMM case：
@@ -154,6 +205,115 @@ bash scripts/bench_reduction.sh
 ```bash
 CASES="1048576 4194304 16777216" WARMUP=5 ITERS=20 VERIFY=1 bash scripts/bench_reduction.sh
 ```
+
+## 当前 Transpose 模块
+
+Transpose 是另一个非常经典的 CUDA 教学算子，因为它能很直观地展示：
+
+- naive 版本里“连续读 + 非连续写”带来的带宽损失
+- shared memory tiled 如何把全局读写都改成 coalesced 访问
+- shared memory padding 如何减少 bank conflict
+
+- `src/transpose/transpose_0.cu`: naive transpose，读连续、写跨 stride
+- `src/transpose/transpose_1.cu`: shared-memory tiled transpose
+- `src/transpose/transpose_2.cu`: shared-memory tiled transpose + padding 消除 bank conflict
+- `src/transpose/transpose_runner.cu`: transpose 的统一运行入口
+- `include/transpose/benchmark_utils.h`: transpose 的 benchmark 公共工具
+- `include/transpose/kernels.h`: transpose kernel 统一接口
+
+单独运行某个 transpose kernel：
+
+```bash
+./build/transpose_runner --kernel transpose_2 --m 4096 --n 4096 --warmup 5 --iters 20 --check
+```
+
+批量 benchmark transpose：
+
+```bash
+bash scripts/bench_transpose.sh
+```
+
+自定义 transpose case：
+
+```bash
+CASES="1024x1024 2048x4096 4096x4096" WARMUP=5 ITERS=20 VERIFY=1 bash scripts/bench_transpose.sh
+```
+
+## 当前 Attention 模块
+
+Attention 实现的是单向前向的 scaled dot-product attention：
+
+```text
+O = softmax(QK^T / sqrt(D)) V
+```
+
+输入张量布局按 `B x H x N x D` 展开存储，其中：
+
+- `B`: batch
+- `H`: heads
+- `N`: sequence length
+- `D`: head dimension
+
+当前三版 kernel 分别对应三种典型思路：
+
+- `src/attention/attention_0.cu`: baseline，一个线程负责一个 query row 的完整输出
+- `src/attention/attention_1.cu`: block 级 fused attention，使用 online softmax，不显式落地 `QK^T`
+- `src/attention/attention_2.cu`: shared-memory tiled fused attention，按 key tile 缓存 `K/V`
+- `src/attention/attention_runner.cu`: attention 的统一运行入口
+- `include/attention/benchmark_utils.h`: attention 的 benchmark 公共工具
+- `include/attention/kernels.h`: attention kernel 统一接口
+
+单独运行某个 attention kernel：
+
+```bash
+./build/attention_runner --kernel attention_2 --batch 1 --heads 8 --seq-len 256 --head-dim 64 --warmup 5 --iters 20 --check
+```
+
+批量 benchmark attention：
+
+```bash
+bash scripts/bench_attention.sh
+```
+
+自定义 attention case：
+
+```bash
+CASES="1x8x128x64 1x8x256x64 1x16x256x128" WARMUP=5 ITERS=20 VERIFY=1 bash scripts/bench_attention.sh
+```
+
+## 性能图表
+
+运行 benchmark 后，可以直接生成图表：
+
+```bash
+python3 scripts/plot_benchmarks.py
+```
+
+脚本会自动读取 `results/` 下每个算子最新的 CSV，并在 `results/plots/` 下生成：
+
+- 每个算子一张 PNG 图
+- 一个 `index.html`，方便统一查看
+
+如果某个算子的 CSV 不存在，或者只有表头没有 benchmark 行，脚本会默认自动执行对应的 benchmark：
+
+- `gemm` -> `make bench-gemm`
+- `reduction` -> `make bench-reduction`
+- `transpose` -> `make bench-transpose`
+- `attention` -> `make bench-attention`
+
+如果你只想画图、不想自动触发 benchmark，可以加：
+
+```bash
+python3 scripts/plot_benchmarks.py --no-auto-bench
+```
+
+每张图都包含三部分：
+
+- 不同 kernel 在不同 shape 下的绝对性能折线
+- 相对 baseline kernel（通常是 `<op>_0`）的加速比折线
+- 不同 kernel 的平均延迟 `avg_ms` 折线
+
+图标题和 `index.html` 里都会明确展示本次使用的输入 shape 列表。
 
 ## ASCII 可视化 `gemm_1`
 

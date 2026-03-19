@@ -1,18 +1,17 @@
-#include "reduction/kernels.h"
+#include "transpose/kernels.h"
 
 #include <cstdio>
 #include <string>
 
-namespace reduction {
+namespace transpose {
 namespace {
 
-// 当前 reduction 模块的 kernel 注册表。
-// 新增实现时，通常只需要：
-// 1. 新建一个 reduction_X.cu，并提供 GetReductionXSpec()
-// 2. 把它加入下面这个数组
+// 当前 transpose 模块的 kernel 注册表。
+// 新增 transpose_X.cu 后，把 GetTransposeXSpec() 加到这里即可。
 KernelSpec kKernels[] = {
-    GetReduction0Spec(),
-    GetReduction1Spec(),
+    GetTranspose0Spec(),
+    GetTranspose1Spec(),
+    GetTranspose2Spec(),
 };
 
 constexpr int kKernelCount = sizeof(kKernels) / sizeof(kKernels[0]);
@@ -20,7 +19,6 @@ constexpr int kKernelCount = sizeof(kKernels) / sizeof(kKernels[0]);
 }  // namespace
 
 // 按名字查找 kernel。
-// 这里仍然采用线性扫描，因为当前数量很少，简单直接即可。
 const KernelSpec *FindKernel(const char *name) {
     for (int i = 0; i < kKernelCount; ++i) {
         if (std::string(kKernels[i].name) == name) {
@@ -30,11 +28,11 @@ const KernelSpec *FindKernel(const char *name) {
     return nullptr;
 }
 
-// 打印所有已注册 kernel，供 runner 和 benchmark 脚本使用。
+// 打印所有已注册 kernel。
 void PrintKernelList() {
     for (int i = 0; i < kKernelCount; ++i) {
         std::printf("%s\n", kKernels[i].name);
     }
 }
 
-}  // namespace reduction
+}  // namespace transpose

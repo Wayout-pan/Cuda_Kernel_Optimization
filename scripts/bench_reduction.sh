@@ -2,6 +2,9 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-13}"
+export PATH="${PATH}:${CUDA_HOME}/bin"
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:${CUDA_HOME}/lib64:${CUDA_HOME}/extras/CUPTI/lib64"
 BUILD_DIR="${ROOT_DIR}/build"
 RESULTS_DIR="${ROOT_DIR}/results"
 RUNNER="${BUILD_DIR}/reduction_runner"
